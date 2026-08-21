@@ -2,6 +2,9 @@
 Streamlit) — separada para poder probarla directamente."""
 
 import itertools
+import json
+import os
+import re
 
 import pandas as pd
 import requests
@@ -11,6 +14,8 @@ LETTERS = ["L", "E", "V"]
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 CATEGORY_PROGOL = "https://quinielaposible.com/category/progol/"
 CATEGORY_MEDIA_SEMANA = "https://quinielaposible.com/category/progol-media-semana/"
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_store")
 
 
 def _latest_article_link(category_url, href_hint):
@@ -219,3 +224,58 @@ def generar_quinielas(df):
         out["No_Favoritos"] = None
 
     return out, n_combos
+
+
+# --------------------------------------------------------------------------
+# Guardado permanente (por usuario, por pool) en disco como JSON
+# --------------------------------------------------------------------------
+def _safe_key(text):
+    """Convierte un identificador (nombre/correo) en un nombre de archivo seguro."""
+    text = (text or "invitado").strip().lower()
+    return re.sub(r"[^a-z0-9_.@-]", "_", text) or "invitado"
+
+
+def _store_path(user_id, tab_key):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, f"{_safe_key(user_id)}__{tab_key}.json")
+
+
+def save_pool_data(user_id, tab_key, df):
+    """Guarda el DataFrame de un pool (Progol/Revancha/Media Semana) para un
+    usuario específico. No lanza excepción si falla — el guardado es
+    'best effort', no debe tumbar la app si el disco no es escribible."""
+    try:
+        path = _store_path(user_id, tab_key)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(df.to_dict(orient="records"), f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_pool_data(user_id, tab_key, default_n):
+    """Carga el DataFrame guardado de un usuario/pool. Si no existe o está
+    corrupto, regresa None (el llamador debe usar blank_games_df)."""
+    path = _store_path(user_id, tab_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        df = pd.DataFrame.from_records(records)
+        esperado = blank_games_df(default_n)
+        if list(df.columns) != list(esperado.columns) or len(df) != default_n:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def clear_pool_data(user_id, tab_key):
+    """Borra el archivo guardado de un usuario/pool, si existe."""
+    path = _store_path(user_id, tab_key)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass

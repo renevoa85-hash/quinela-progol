@@ -17,9 +17,12 @@ import streamlit as st
 from engine import (
     auto_marcar_dobles,
     blank_games_df,
+    clear_pool_data,
     fetch_cartelera,
     fetch_media_semana,
     generar_quinielas,
+    load_pool_data,
+    save_pool_data,
     validar_dobles,
 )
 
@@ -27,6 +30,36 @@ st.set_page_config(page_title="Sistema de Reducción de Quinielas", layout="wide
 
 st.title("🎯 Sistema de Reducción de Quinielas")
 st.caption("Progol, Revancha y Media Semana — carga la cartelera, mete tus cuotas, marca dobles y filtra.")
+
+
+def _get_user_id():
+    """Identifica al usuario para guardar sus datos por separado.
+    Si la app corre en Streamlit Community Cloud con acceso restringido
+    (viewers por correo), usa ese correo automáticamente. Si no, pide
+    nombre/correo una vez por sesión."""
+    try:
+        if st.user.is_logged_in and st.user.email:
+            return st.user.email
+    except Exception:
+        pass
+
+    if "user_id" not in st.session_state:
+        st.session_state["user_id"] = ""
+
+    if not st.session_state["user_id"]:
+        st.info("Escribe tu nombre o correo para que tus cuotas y quinielas se guarden a tu nombre "
+                 "(usa siempre el mismo para que se recupere lo que ya tenías).")
+        nombre = st.text_input("Tu nombre o correo", key="user_id_input")
+        if nombre.strip():
+            st.session_state["user_id"] = nombre.strip()
+            st.rerun()
+        st.stop()
+
+    return st.session_state["user_id"]
+
+
+USER_ID = _get_user_id()
+st.caption(f"👤 Guardando como: **{USER_ID}**")
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -39,13 +72,16 @@ def cached_fetch_media_semana():
     return fetch_media_semana()
 
 
-def render_pool(tab_key, default_n, pool_label):
+def render_pool(tab_key, default_n, pool_label, user_id):
     st.subheader(pool_label)
 
     df_key = f"df_{tab_key}"
     ver_key = f"editor_ver_{tab_key}"
     if df_key not in st.session_state:
-        st.session_state[df_key] = blank_games_df(default_n)
+        guardado = load_pool_data(user_id, tab_key, default_n)
+        st.session_state[df_key] = guardado if guardado is not None else blank_games_df(default_n)
+        if guardado is not None:
+            st.toast(f"Se recuperaron tus datos guardados de {pool_label}.", icon="💾")
     if ver_key not in st.session_state:
         st.session_state[ver_key] = 0
 
@@ -55,28 +91,39 @@ def render_pool(tab_key, default_n, pool_label):
         # las primeras celdas que edites a mano necesitan doble entrada).
         st.session_state[ver_key] += 1
 
-    if st.button("🔄 Cargar cartelera automática", key=f"btn_cartelera_{tab_key}"):
-        try:
-            if tab_key == "media_semana":
-                games, fuente = cached_fetch_media_semana()
-            else:
-                progol_games, revancha_games, fuente = cached_fetch_cartelera()
-                games = progol_games if tab_key == "progol" else revancha_games
-            if not games:
-                st.error(f"No encontré partidos de '{pool_label}' en la fuente "
-                          "(puede que este concurso no tenga esta modalidad).")
-            else:
-                df = st.session_state[df_key].copy()
-                n = min(len(games), len(df))
-                for i in range(n):
-                    df.loc[i, "Local"] = games[i][0]
-                    df.loc[i, "Visitante"] = games[i][1]
-                st.session_state[df_key] = df
-                _bump_editor()
-                st.success(f"Cartelera cargada desde {fuente}")
-        except RuntimeError as e:
-            st.error(f"No se pudo cargar la cartelera automáticamente: {e}\n\n"
-                     f"Puedes escribir los equipos a mano en la tabla de abajo.")
+    col_cartelera, col_limpiar = st.columns([2, 1])
+    with col_cartelera:
+        if st.button("🔄 Cargar cartelera automática", key=f"btn_cartelera_{tab_key}"):
+            try:
+                if tab_key == "media_semana":
+                    games, fuente = cached_fetch_media_semana()
+                else:
+                    progol_games, revancha_games, fuente = cached_fetch_cartelera()
+                    games = progol_games if tab_key == "progol" else revancha_games
+                if not games:
+                    st.error(f"No encontré partidos de '{pool_label}' en la fuente "
+                              "(puede que este concurso no tenga esta modalidad).")
+                else:
+                    df = st.session_state[df_key].copy()
+                    n = min(len(games), len(df))
+                    for i in range(n):
+                        df.loc[i, "Local"] = games[i][0]
+                        df.loc[i, "Visitante"] = games[i][1]
+                    st.session_state[df_key] = df
+                    save_pool_data(user_id, tab_key, df)
+                    _bump_editor()
+                    st.success(f"Cartelera cargada desde {fuente}")
+            except RuntimeError as e:
+                st.error(f"No se pudo cargar la cartelera automáticamente: {e}\n\n"
+                         f"Puedes escribir los equipos a mano en la tabla de abajo.")
+
+    with col_limpiar:
+        if st.button("🗑️ Limpiar datos", key=f"limpiar_{tab_key}"):
+            st.session_state[df_key] = blank_games_df(default_n)
+            st.session_state.pop(f"result_{tab_key}", None)
+            clear_pool_data(user_id, tab_key)
+            _bump_editor()
+            st.success(f"Se borraron tus datos de {pool_label}.")
 
     st.caption("Captura las cuotas de casino directamente en la tabla de abajo (columnas Cuota_L / Cuota_E / Cuota_V).")
 
@@ -92,30 +139,42 @@ def render_pool(tab_key, default_n, pool_label):
             try:
                 nuevo_df = auto_marcar_dobles(st.session_state[df_key], n_deseado)
                 st.session_state[df_key] = nuevo_df
+                save_pool_data(user_id, tab_key, nuevo_df)
                 _bump_editor()
                 st.success(f"Se marcaron los {n_deseado} partidos con cuotas más parejas como DOBLE "
                            f"(el resto quedó fijo con su favorito).")
             except ValueError as e:
                 st.error(f"No se pudo marcar automáticamente: {e}\n\nLlena todas las cuotas primero.")
 
-    edited = st.data_editor(
-        st.session_state[df_key],
-        key=f"editor_{tab_key}_{st.session_state[ver_key]}",
-        num_rows="fixed",
-        use_container_width=True,
-        column_config={
-            "No": st.column_config.NumberColumn(disabled=True, width="small"),
-            "Local": st.column_config.TextColumn(width="medium"),
-            "Visitante": st.column_config.TextColumn(width="medium"),
-            "Cuota_L": st.column_config.NumberColumn(format="%.2f", step=0.01),
-            "Cuota_E": st.column_config.NumberColumn(format="%.2f", step=0.01),
-            "Cuota_V": st.column_config.NumberColumn(format="%.2f", step=0.01),
-            "Selección": st.column_config.SelectboxColumn(options=["L", "E", "V", "DOBLE"]),
-            "Doble_Op1": st.column_config.SelectboxColumn(options=["", "L", "E", "V"]),
-            "Doble_Op2": st.column_config.SelectboxColumn(options=["", "L", "E", "V"]),
-        },
-    )
-    st.session_state[df_key] = edited
+    with st.form(key=f"form_{tab_key}", border=False):
+        edited = st.data_editor(
+            st.session_state[df_key],
+            key=f"editor_{tab_key}_{st.session_state[ver_key]}",
+            num_rows="fixed",
+            use_container_width=True,
+            column_config={
+                "No": st.column_config.NumberColumn(disabled=True, width="small"),
+                "Local": st.column_config.TextColumn(width="medium"),
+                "Visitante": st.column_config.TextColumn(width="medium"),
+                "Cuota_L": st.column_config.NumberColumn(format="%.2f", step=0.01),
+                "Cuota_E": st.column_config.NumberColumn(format="%.2f", step=0.01),
+                "Cuota_V": st.column_config.NumberColumn(format="%.2f", step=0.01),
+                "Selección": st.column_config.SelectboxColumn(options=["L", "E", "V", "DOBLE"]),
+                "Doble_Op1": st.column_config.SelectboxColumn(options=["", "L", "E", "V"]),
+                "Doble_Op2": st.column_config.SelectboxColumn(options=["", "L", "E", "V"]),
+            },
+        )
+        guardar = st.form_submit_button("💾 Guardar cambios en la tabla", type="primary")
+
+    if guardar:
+        st.session_state[df_key] = edited
+        save_pool_data(user_id, tab_key, edited)
+        st.toast("Cambios guardados.", icon="💾")
+    else:
+        # Mientras no le den "Guardar", seguimos mostrando/usando lo último
+        # confirmado (no lo que está a medio escribir en la tabla), para que
+        # los contadores/botones de abajo no se desincronicen con la grilla.
+        edited = st.session_state[df_key]
 
     n_dobles = int((edited["Selección"] == "DOBLE").sum())
     n_quinielas_previstas = 2 ** n_dobles
@@ -174,15 +233,16 @@ tab_progol, tab_revancha, tab_media_semana = st.tabs(
     ["Progol (14 partidos)", "Revancha (7 partidos)", "Media Semana (9 partidos)"]
 )
 with tab_progol:
-    render_pool("progol", 14, "Progol — 14 partidos")
+    render_pool("progol", 14, "Progol — 14 partidos", USER_ID)
 with tab_revancha:
-    render_pool("revancha", 7, "Revancha — 7 partidos")
+    render_pool("revancha", 7, "Revancha — 7 partidos", USER_ID)
 with tab_media_semana:
-    render_pool("media_semana", 9, "Progol Media Semana — 9 partidos")
+    render_pool("media_semana", 9, "Progol Media Semana — 9 partidos", USER_ID)
 
 st.divider()
 st.caption(
     "⚠️ El botón de cartelera automática trae los NOMBRES de los equipos desde quinielaposible.com "
     "(puede fallar si esa página cambia de formato). Las CUOTAS de casino no se cargan solas — "
-    "no hay una fuente única y estable para momios en vivo — captúralas a mano o súbelas por CSV/Excel."
+    "no hay una fuente única y estable para momios en vivo — captúralas a mano en la tabla. "
+    "Tus datos se guardan automáticamente a tu nombre; usa '🗑️ Limpiar datos' para borrarlos."
 )
